@@ -3,3 +3,4 @@ numpy
 yfinance
 pyTelegramBotAPI
 requests
+flask
