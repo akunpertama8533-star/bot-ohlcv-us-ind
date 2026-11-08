@@ -1,4 +1,4 @@
-"""Bot Telegram OHLCV (yfinance) — v3: timeframe 5m + validasi chunk & anomali.
+"""Bot Telegram OHLCV (yfinance) — v3: timeframe 5m + validasi chunk & anomali + Web Server Keep-Alive (Flask).
 
 Baru di versi ini
   1. Timeframe 5m (batas Yahoo ±60 hari; di-chunk per 50 hari seperti 15m/30m).
@@ -11,9 +11,10 @@ Baru di versi ini
      sambungan antar-chunk konsisten.
   5. Laporan validasi (.txt) dikirim bila ada peringatan/masalah, atau selalu
      dengan flag `report`.
+  6. Server Web Flask internal (`keep_alive`) untuk mencegah mode sleep pada Render Web Service.
 
 Menjalankan:
-    pip install pandas numpy yfinance pyTelegramBotAPI requests
+    pip install pandas numpy yfinance pyTelegramBotAPI requests flask
     set TELEGRAM_BOT_TOKEN=<token dari BotFather>        (Windows CMD)
     export TELEGRAM_BOT_TOKEN=<token dari BotFather>     (Linux/macOS)
     # opsional: batasi pengguna (pisahkan dengan koma)
@@ -36,9 +37,30 @@ import numpy as np
 import pandas as pd
 import telebot
 import yfinance as yf
+from flask import Flask
 from requests import exceptions as req_exc
 
-# ====================== KONFIGURASI ======================
+# ====================== KONFIGURASI WEB SERVER (KEEP ALIVE) ======================
+app = Flask("")
+
+
+@app.route("/")
+def home():
+    return "Bot OHLCV Web Service is Running!"
+
+
+def run_web():
+    port = int(os.getenv("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+
+def keep_alive():
+    t = threading.Thread(target=run_web)
+    t.daemon = True
+    t.start()
+
+
+# ====================== KONFIGURASI BOT ======================
 # Bot dibuat di main() agar modul bisa di-import/diuji tanpa token.
 bot = None
 
@@ -77,8 +99,6 @@ CHUNK_DAYS = {
 }
 
 # Batas riwayat intraday Yahoo Finance (hari ke belakang dari hari ini).
-# Nilai sengaja diberi margin 1 hari dari batas yang saya ketahui
-# (60 hari untuk <1h, 730 hari untuk 1h). Perlu diverifikasi dengan data asli.
 INTRADAY_LIMIT_DAYS = {
     "5m": 59,
     "15m": 59,
@@ -224,8 +244,6 @@ def apply_timezone(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     tz = detect_timezone(ticker)
     try:
         if df.index.tz is None:
-            # Indeks naive berisi tanggal saja (jam 00:00) = tanggal lokal bursa,
-            # jangan digeser lewat UTC. Selain itu, asumsikan UTC seperti semula.
             if (df.index == df.index.normalize()).all():
                 df.index = df.index.tz_localize(tz)
             else:
@@ -435,11 +453,6 @@ def check_spikes(df: pd.DataFrame, interval: str):
 
 
 def check_coverage(df: pd.DataFrame, interval: str, req_start, req_end):
-    """Apakah data mencakup rentang yang diminta (di luar libur/akhir pekan).
-
-    Return (findings, targets). Target refetch dibuat untuk ujung yang bolong, mis. chunk
-    terakhir yang gagal, karena celah di ujung tidak terlihat oleh pencarian hari-hilang.
-    """
     out, targets = [], []
     if req_start is None or req_end is None or df.empty:
         return out, targets
@@ -461,7 +474,6 @@ def check_coverage(df: pd.DataFrame, interval: str, req_start, req_end):
 
 
 def check_period_gaps(df: pd.DataFrame, interval: str):
-    """Candle mingguan/bulanan yang hilang (selisih antar-candle terlalu besar)."""
     out = []
     if len(df) < 2:
         return out
@@ -477,7 +489,6 @@ def check_period_gaps(df: pd.DataFrame, interval: str):
 
 
 def find_absent_runs(df: pd.DataFrame):
-    """Deretan hari kerja (Sen–Jum) yang tidak punya satu pun bar. Return list of list[Timestamp]."""
     dates = pd.DatetimeIndex(df.index.tz_localize(None).normalize()).unique()
     if len(dates) < 2:
         return []
@@ -523,12 +534,6 @@ def analyze_missing_sessions(df: pd.DataFrame, boundary_dates):
 
 
 def analyze_intraday_gaps(df: pd.DataFrame, boundary_dates):
-    """Deteksi bar yang hilang di dalam hari berdasarkan pola sesi hasil belajar dari data.
-
-    Pola tiap hari-dalam-pekan = jam bar yang muncul di >= 50% hari bersangkutan, sehingga
-    jam istirahat siang, sesi Jumat, dsb. otomatis dianggap normal tanpa jam bursa hardcode.
-    Return (findings, targets, completeness, boundary_problem).
-    """
     findings, targets = [], []
     idx = df.index
     frame = pd.DataFrame({"d": np.asarray(idx.date), "m": np.asarray(idx.hour * 60 + idx.minute)})
@@ -618,7 +623,6 @@ def analyze_intraday_gaps(df: pd.DataFrame, boundary_dates):
 
 
 def analyze_dataframe(df, interval, req_start=None, req_end=None, boundary_dates=frozenset()):
-    """Analisis menyeluruh atas data gabungan. Return Analysis."""
     if df is None or df.empty:
         return Analysis([Finding("ERROR", "Tidak ada data untuk dianalisis")], [])
     intraday = interval in INTRADAY_INTERVALS
@@ -649,7 +653,6 @@ def analyze_dataframe(df, interval, req_start=None, req_end=None, boundary_dates
 
 
 def check_resample_consistency(base: pd.DataFrame, res: pd.DataFrame, label: str):
-    """Pastikan agregasi (mis. 15m → 45m) tidak menghilangkan bar/volume."""
     if base.empty or res.empty:
         return []
     vb, vr = float(base["Volume"].sum()), float(res["Volume"].sum())
@@ -670,12 +673,6 @@ def check_resample_consistency(base: pd.DataFrame, res: pd.DataFrame, label: str
 
 # ====================== VALIDASI CHUNK & PEMULIHAN ======================
 def assess_chunk(df_chunk, c_start: datetime, c_end: datetime, is_first: bool, is_last: bool):
-    """Nilai satu chunk mentah. Return (perlu_diulang, catatan).
-
-    Tepi chunk interior yang bolong biasanya akibat throttling/pemotongan jendela,
-    jadi layak diambil ulang. Tepi terluar (awal rentang / hari ini) bisa wajar:
-    saham baru listing atau data terbaru belum ada, hanya dicatat.
-    """
     expected = _bdays(c_start, c_end)
     if df_chunk is None or df_chunk.empty:
         if expected >= MIN_EXPECTED_BDAYS:
@@ -695,7 +692,6 @@ def assess_chunk(df_chunk, c_start: datetime, c_end: datetime, is_first: bool, i
 
 
 def overlap_stats(df_all: pd.DataFrame):
-    """Bandingkan bar kembar (hasil tumpang-tindih chunk). Return (n_kembar, n_beda_ohlc, n_beda_volume)."""
     dup = df_all.loc[df_all.index.duplicated(keep=False), COLS]
     if dup.empty:
         return 0, 0, 0
@@ -709,7 +705,6 @@ def overlap_stats(df_all: pd.DataFrame):
 
 
 def classify_chunks(reports):
-    """Beri level tiap chunk dan hasilkan temuan tingkat-chunk."""
     out = []
     total = len(reports)
     nonempty = [r.index for r in reports if r.rows > 0]
@@ -760,14 +755,6 @@ def classify_chunks(reports):
 
 
 def fetch_long_history(ticker, start_date, end_date, yf_interval, message=None, today=None):
-    """Ambil data (di-chunk bila perlu) dan validasi tiap chunk. Return FetchResult.
-
-    - Tiap chunk dinilai (assess_chunk); chunk kosong/bolong di tepi interior diambil ulang
-      sampai CHUNK_MAX_ATTEMPTS kali.
-    - Chunk ke-2 dst. mulai CHUNK_OVERLAP_DAYS lebih awal; bar kembar dibandingkan
-      untuk membuktikan sambungan antar-chunk konsisten.
-    - Chunk yang tetap gagal tidak membatalkan proses; data lain tetap dikembalikan.
-    """
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
     max_days = CHUNK_DAYS.get(yf_interval)
@@ -821,7 +808,7 @@ def fetch_long_history(ticker, start_date, end_date, yf_interval, message=None, 
                 df_chunk, last_err = None, e
                 print(f"[CHUNK ERROR] {ticker} {start_str} → {end_label}: {type(e).__name__}: {e}")
                 if not is_transient_error(e):
-                    break  # error permanen: mengulang tidak membantu
+                    break
 
             if last_err is None:
                 retry, last_notes = assess_chunk(df_chunk, c_start, eff_end, i == 1, i == total)
@@ -886,7 +873,6 @@ def fetch_long_history(ticker, start_date, end_date, yf_interval, message=None, 
 
 
 def merge_windows(items):
-    """Gabungkan jendela tanggal (awal, akhir) yang bersinggungan/bersebelahan."""
     out = []
     for s, e in sorted(items):
         if out and s <= out[-1][1] + timedelta(days=1):
@@ -897,7 +883,6 @@ def merge_windows(items):
 
 
 def select_repair_windows(targets, lo: Optional[date], hi: Optional[date]):
-    """Pilih jendela refetch berdasarkan prioritas, dibatasi MAX_REPAIR_WINDOWS."""
     selected = []
     for _, s, e in sorted(targets, key=lambda t: (t[0], t[1])):
         if lo and s < lo:
@@ -913,7 +898,6 @@ def select_repair_windows(targets, lo: Optional[date], hi: Optional[date]):
 
 
 def repair_gaps(ticker, df, yf_interval, windows, req_start: datetime, req_end: datetime):
-    """Ambil ulang jendela bermasalah; tambahkan hanya bar yang belum ada. Return (df, bar_ditambah)."""
     added_total = 0
     lo, hi = pd.Timestamp(req_start.date()), pd.Timestamp(req_end.date())
     for k, (ws, we) in enumerate(windows):
@@ -942,10 +926,6 @@ def repair_gaps(ticker, df, yf_interval, windows, req_start: datetime, req_end: 
 
 
 def validate_and_repair(ticker, df, yf_interval, req_start, req_end, fetch: FetchResult, pre_findings):
-    """Analisis data gabungan → refetch jendela bermasalah → analisis ulang.
-
-    Return (df, findings, completeness).
-    """
     boundary = fetch.boundary_dates
     analysis = analyze_dataframe(df, yf_interval, req_start, req_end, boundary)
     extra = []
@@ -1041,10 +1021,6 @@ INTERVAL_LABELS = {
 
 
 def build_csv_filename(ticker, interval_input, df, start_date=None, end_date=None):
-    """Format: KODE_TIMEFRAME_TANGGALMULAI_to_TANGGALAKHIR.csv
-    Contoh: BBCA.JK_1h_2025-01-01_to_2025-06-30.csv
-    Jika rentang tidak diketahui (ytd/max), dipakai tanggal data pertama dan terakhir di df.
-    """
     label = INTERVAL_LABELS.get(interval_input, interval_input) if interval_input else "data"
     if not (start_date and end_date) and not df.empty:
         start_date = df.index.min().strftime("%Y-%m-%d")
@@ -1076,7 +1052,6 @@ def send_result(message, ticker, df, info, want_csv, interval_input=None, start_
                 outcome=None, want_report=False):
     if want_csv:
         filename = build_csv_filename(ticker, interval_input, df, start_date, end_date)
-
         buf = io.BytesIO(df.to_csv().encode("utf-8"))
         buf.name = filename
         bot.send_document(
@@ -1096,7 +1071,6 @@ def send_result(message, ticker, df, info, want_csv, interval_input=None, start_
                 f"Menampilkan {len(df_show)} baris terakhir dari total {len(df)} baris\n\n"
                 f"<pre>{body}</pre>"
             )
-            # Batas Telegram 4096 karakter; kurangi baris sampai muat.
             if len(text) <= TELEGRAM_TEXT_LIMIT or rows <= 1:
                 break
             rows -= 1
@@ -1115,11 +1089,6 @@ def authorized(message) -> bool:
 
 
 def parse_command(text):
-    """Pisahkan flag ('csv', 'report') dari argumen. Return (args, flags).
-
-    Token flag hanya dianggap flag mulai posisi ke-3 (setelah perintah dan kode),
-    supaya ticker sungguhan bernama CSV (NYSE) tidak ikut terhapus.
-    """
     raw = (text or "").split()
     head, tail = raw[:2], raw[2:]
     known = {"csv", "report"}
@@ -1222,11 +1191,9 @@ def _handle_ohlcv(message):
 
         notes = []
         use_period_max = False
-        label_dates = True  # tampilkan tanggal di info & nama file
+        label_dates = True
 
-        # ---------- Tentukan rentang ----------
         if len(args) >= 5 and is_date(args[3]) and is_date(args[4]):
-            # MODE 1: custom range
             start_dt = datetime.strptime(args[3], "%Y-%m-%d")
             end_dt = datetime.strptime(args[4], "%Y-%m-%d")
             if end_dt < start_dt:
@@ -1234,7 +1201,6 @@ def _handle_ohlcv(message):
                 return
             range_info = f"{args[3]} → {args[4]}"
         elif len(args) >= 4:
-            # MODE 2: shortcut range
             range_input = args[3].lower()
             if range_input not in RANGE_SHORTCUTS:
                 fail(message,
@@ -1264,12 +1230,11 @@ def _handle_ohlcv(message):
             fail(message, "Format salah. Ketik /help untuk melihat cara pakai.")
             return
 
-        # ---------- Ambil data ----------
         if use_period_max:
             df_raw = fetch_history_with_retry(ticker, period="max", interval=yf_interval)
             fetch = FetchResult(df=df_raw if df_raw is not None else pd.DataFrame())
             start_date = end_date = None
-            v_start = v_end = None  # rentang tak diketahui: cek cakupan & refetch dilewati
+            v_start = v_end = None
         else:
             start_dt, clamped, out_of_range = clamp_to_provider_limit(
                 yf_interval, start_dt, end_dt, today
@@ -1303,7 +1268,6 @@ def _handle_ohlcv(message):
             fail(message, f"❌ Tidak ada data untuk {ticker} pada rentang tersebut.")
             return
 
-        # ---------- Olah, validasi & pulihkan ----------
         df = df[COLS].copy()
         df = apply_timezone(df, ticker)
         df, clean_findings = clean_frame(df)
@@ -1356,13 +1320,16 @@ def main():
         print("❌ Variabel lingkungan TELEGRAM_BOT_TOKEN belum diatur. Bot tidak dijalankan.")
         sys.exit(1)
 
+    # Jalankan Server Web Flask di Latar Belakang (Keep-Alive untuk Render)
+    keep_alive()
+
     bot = telebot.TeleBot(token, parse_mode=None)
     bot.message_handler(commands=["start", "help"])(welcome)
     bot.message_handler(commands=["ohlcv"])(get_ohlcv)
 
     if not ALLOWED_CHAT_IDS:
         print("⚠️ ALLOWED_CHAT_IDS kosong: siapa pun yang menemukan bot ini bisa memakainya.")
-    print("✅ Bot OHLCV (Shortcut Range + Validasi Chunk) sedang berjalan...")
+    print("✅ Bot OHLCV (Web Service + Flask Keep-Alive) sedang berjalan...")
     print("Tekan Ctrl+C untuk menghentikan.")
 
     while True:
