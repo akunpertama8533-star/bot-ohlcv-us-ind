@@ -994,7 +994,7 @@ def _handle_ohlcv(message):
 
 def main():
     global bot
-     = TELEGRAM_BOT_
+= TELEGRAM_BOT_TOKEN
     if not token or token == "8833515035:AAGKrxeesIBgt_B0TbbV4UvZDLcpojLb29M":
         print("❌ TELEGRAM_BOT_TOKEN belum diisi di dalam skrip.")
         sys.exit(1)
