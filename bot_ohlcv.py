@@ -995,8 +995,10 @@ def _handle_ohlcv(message):
 def main():
     global bot
     token = TELEGRAM_BOT_TOKEN
-    if not token or token == "8833515035:AAGKrxeesIBgt_B0TbbV4UvZDLcpojLb29M":
-        print("❌ TELEGRAM_BOT_TOKEN belum diisi di dalam skrip.")
+    
+    # Cek sederhana: jika token kosong atau masih berupa placeholder, hentikan program
+    if not token or "MASUKKAN_TOKEN" in token:
+        print("❌ TELEGRAM_BOT_TOKEN belum diisi dengan benar di dalam skrip.")
         sys.exit(1)
 
     keep_alive()
@@ -1013,7 +1015,3 @@ def main():
         except Exception as e:
             print(f"[POLLING ERROR] {e}")
             time.sleep(10)
-
-
-if __name__ == "__main__":
-    main()
